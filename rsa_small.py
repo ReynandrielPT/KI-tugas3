@@ -1,4 +1,5 @@
 import secrets
+from typing import Tuple, Dict, Any
 
 def _egcd(a: int, b: int):
     if b == 0:
@@ -62,7 +63,7 @@ def generate_keypair(bits: int = 1024):
         d = _invmod(e, phi)
         return (n, e), (n, d)
 
-def encrypt(plaintext: bytes, pubkey: tuple[int, int]) -> bytes:
+def encrypt(plaintext: bytes, pubkey: Tuple[int, int]) -> bytes:
     n, e = pubkey
     m = int.from_bytes(plaintext, 'big')
     if m >= n:
@@ -71,7 +72,7 @@ def encrypt(plaintext: bytes, pubkey: tuple[int, int]) -> bytes:
     k = (n.bit_length() + 7) // 8
     return c.to_bytes(k, 'big')
 
-def decrypt(ciphertext: bytes, privkey: tuple[int, int]) -> bytes:
+def decrypt(ciphertext: bytes, privkey: Tuple[int, int]) -> bytes:
     n, d = privkey
     c = int.from_bytes(ciphertext, 'big')
     m = pow(c, d, n)
@@ -83,11 +84,11 @@ def decrypt(ciphertext: bytes, privkey: tuple[int, int]) -> bytes:
         i += 1
     return b[i:]
 
-def serialize_pub(pub: tuple[int, int]) -> dict:
+def serialize_pub(pub: Tuple[int, int]) -> Dict[str, Any]:
     n, e = pub
     return {'n': format(n, 'x'), 'e': e}
 
-def deserialize_pub(obj: dict) -> tuple[int, int]:
+def deserialize_pub(obj: Dict[str, Any]) -> Tuple[int, int]:
     n = int(str(obj['n']), 16)
     e = int(obj['e'])
     return (n, e)

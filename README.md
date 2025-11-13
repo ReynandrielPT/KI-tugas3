@@ -10,9 +10,16 @@ Mirip dengan versi Tugas2, tetapi sekarang ada distribusi kunci publik RSA untuk
 
 ## Cara Pakai (1 Mesin / 2 Mesin)
 
+### Requirements
+
+- Python 3.8 or newer.
+- Works on Windows PowerShell.
+
+Jika Anda menggunakan Python 3.8, seluruh anotasi tipe sudah disesuaikan agar kompatibel (tidak perlu Python 3.9).
+
 1. Terminal 1 (misal `alice`):
 
-   ```powershell
+   ```
    python client3.py alice
    ```
 
@@ -20,15 +27,17 @@ Mirip dengan versi Tugas2, tetapi sekarang ada distribusi kunci publik RSA untuk
 
 2. Terminal 2 (misal `bob`):
 
-   ```powershell
+   ```
    python client3.py bob alice
    ```
 
-3. Handshake:
+3. Handshake (otomatis):
 
-   - Masing-masing kirim pesan `pub` (public key).
-   - Setelah menerima pub lawan, kirim `keyx` (DES session key terenkripsi RSA).
-   - Setelah kunci sesi 8 byte diterima dan didekripsi, status: "Session key established".
+   - Jalankan `alice` dulu (tanpa peer). Alice akan menunggu pesan masuk.
+   - Jalankan `bob` dengan peer `alice`. Bob otomatis mengirim `pub` ke `alice`.
+   - Alice otomatis "auto-adopt" peer dari pengirim pertama `pub`, mengirim balik `pub`.
+   - HANYA salah satu pihak mengirim `keyx` (penentu: id yang lebih kecil secara leksikografis, mis. `alice` < `bob`). Pengirim langsung menganggap sesi siap setelah mengirim `keyx`; penerima akan siap setelah berhasil mendekripsi.
+   - Ketika kunci sesi 8 byte diterima dan didekripsi, akan muncul: "Session key established".
 
 4. Chat:
    - Ketik pesan biasa setelah sesi siap.

@@ -1,10 +1,12 @@
 import socket, sys, json, threading, time, os, hashlib
 from urllib.request import Request, urlopen
+from urllib.error import URLError
 from urllib.parse import urlparse
 from des_traditional import encrypt_ecb_bytes, decrypt_ecb_bytes
 import rsa_small
 
 SERVER_DEFAULT = 'http://127.0.0.1:8002'
+VERBOSE = False  # reduce console noise; set True for detailed handshake/debug logs
 _embedded_started = False
 
 def http_post_json(url, obj):
@@ -284,12 +286,16 @@ def main():
         print('[send] plaintext:', line)
         print('[send] encrypted:', cipher.hex())
 
-if __name__ == '__main__':
-    try: main()
+if False and __name__ == '__main__':
+    # Legacy entrypoint disabled to avoid double-running two clients in one process.
+    try:
+        main()
     except KeyboardInterrupt:
         print('\n[exit] Interrupted.')
-        try: sys.exit(0)
-        except SystemExit: pass
+        try:
+            sys.exit(0)
+        except SystemExit:
+            pass
 
 def _embedded_send_response(conn, status, reason, headers, body):
     hdrs = dict(headers or {})
@@ -403,9 +409,22 @@ def start_embedded_server_if_needed(base_url: str):
     try:
         threading.Thread(target=_embedded_server_loop, args=(host, port), daemon=True).start()
         _embedded_started = True
-        print(f"[info] Embedded relay started on http://{host}:{port}")
+        if VERBOSE:
+            print(f"[info] Embedded relay starting on http://{host}:{port} ...")
     except Exception as e:
         print(f"[warn] Failed to start embedded relay: {e}")
+
+def wait_for_relay(base_url: str, retries: int = 20, delay: float = 0.2) -> bool:
+    """Probe the relay HTTP endpoint until it's ready or retries exhausted."""
+    for _ in range(max(1, retries)):
+        try:
+            status, _ = http_get(base_url + f"/recv?client=__probe__&wait=0")
+            if status in (200, 204, 400):
+                return True
+        except Exception:
+            pass
+        time.sleep(delay)
+    return False
 
 def usage():
     print("Usage: python client3.py <my_id> [peer_id]\nCommands: /to <peer> | /quit")
@@ -417,16 +436,22 @@ def main():
         usage(); return
     my_id = args[0]
     peer_id = args[1] if len(args) >= 2 else None
+    # Ensure embedded relay is up locally; if not, start and wait briefly.
     start_embedded_server_if_needed(base)
-    print(f"[info] my_id={my_id}")
-    if peer_id: print(f"[info] peer={peer_id}")
+    if not wait_for_relay(base):
+        print('[warn] Relay not ready yet; client will retry automatically...')
+    if VERBOSE:
+        print(f"[info] my_id={my_id}")
+        if peer_id:
+            print(f"[info] peer={peer_id}")
     else:
         try:
             p = input("[setup] Enter peer id (Enter to wait): ").strip()
             if p: peer_id = p; print(f"[info] peer={peer_id}")
         except (EOFError, KeyboardInterrupt): pass
 
-    print("[info] Generating RSA keypair...")
+    if VERBOSE:
+        print("[info] Generating RSA keypair...")
     pub, priv = rsa_small.generate_keypair(1024)
     def pub_fingerprint(p):
         try:
@@ -437,8 +462,9 @@ def main():
         return hashlib.sha256(data).hexdigest()[:16]
 
     my_pub_fp = pub_fingerprint(pub)
-    print("[info] RSA pub n bits=", (pub[0].bit_length()))
-    print(f"[info] Our RSA pub fp={my_pub_fp}")
+    if VERBOSE:
+        print("[info] RSA pub n bits=", (pub[0].bit_length()))
+        print(f"[info] Our RSA pub fp={my_pub_fp}")
     session_key = os.urandom(8)
     have_peer_pub = False
     peer_pub = None
@@ -469,36 +495,65 @@ def main():
         for data in batch:
             cipher = encrypt_ecb_bytes(data, session_key)
             send_payload({'from': my_id, 'to': peer_id, 'type': 'text', 'cipher': cipher.hex(), 'size': len(data)})
-            print('[send] (queued) plaintext:', data.decode('utf-8', 'replace'))
-            print('[send] (queued) encrypted:', cipher.hex())
+            # Log only after HTTP send: plaintext
+            print('[send]', data.decode('utf-8', 'replace'))
+            if VERBOSE:
+                print('[send] encrypted:', cipher.hex())
 
     def maybe_send_pub():
         nonlocal my_pub_sent
         if peer_id and not my_pub_sent:
             send_payload({'from': my_id, 'to': peer_id, 'type': 'pub', 'msg': json.dumps(rsa_small.serialize_pub(pub))})
             my_pub_sent = True
-            print(f"[handshake] Sent our public key fp={my_pub_fp} to {peer_id}")
+            if VERBOSE:
+                print(f"[handshake] Sent our public key fp={my_pub_fp} to {peer_id}")
 
     def maybe_send_session_key():
-        nonlocal key_sent
-        if have_peer_pub and not key_sent:
+        nonlocal key_sent, session_established
+        # Deterministic role: only the lexicographically smaller id sends key
+        if not peer_id:
+            return
+        am_sender = (my_id < peer_id)
+        if have_peer_pub and am_sender and not key_sent:
             enc_key_bytes = rsa_small.encrypt(session_key, peer_pub)
             send_payload({'from': my_id, 'to': peer_id, 'type': 'keyx', 'msg': enc_key_bytes.hex(), 'size': len(session_key)})
             key_sent = True
             # Show short fingerprints for visibility (not secure, for demo)
             sk_fp = hashlib.sha256(session_key).hexdigest()[:16]
             peer_fp = peer_pub_fp or "unknown"
-            print(f"[handshake] Sent encrypted session key (sk_fp={sk_fp}) using peer fp={peer_fp}")
+            if VERBOSE:
+                print(f"[handshake] Sent encrypted session key (sk_fp={sk_fp}) using peer fp={peer_fp}")
+            # Sender already knows the session key; mark session as established and flush pending messages
+            if not session_established:
+                session_established = True
+                print(f"[handshake] Session key established (sk_fp={sk_fp})")
+                flush_outgoing_queue()
 
     def receiver_loop():
-        nonlocal have_peer_pub, peer_pub, session_established, session_key
+        nonlocal have_peer_pub, peer_pub, peer_pub_fp, session_established, session_key, peer_id
         while not stop_flag['stop']:
             try:
-                status, body = http_get(base + f"/recv?client={my_id}&wait=30")
+                status, body = http_get(base + f"/recv?client={my_id}&wait=5")
             except Exception as e:
-                if not stop_flag['stop']:
+                # Suppress common transient network errors and exit quietly on stop
+                if stop_flag['stop']:
+                    break
+                suppress = False
+                # Detect common Windows socket errors 10054/10061 wrapped in URLError
+                if isinstance(e, URLError) and hasattr(e, 'reason'):
+                    reason = e.reason
+                    err_no = getattr(reason, 'errno', None) or getattr(reason, 'winerror', None)
+                    if err_no in (10054, 10061):
+                        suppress = True
+                elif isinstance(e, OSError):
+                    if e.errno in (10054, 10061):
+                        suppress = True
+                if not suppress:
                     print(f"[recv] error: {e}")
-                time.sleep(1); continue
+                # Try to ensure relay is running (local embedded) then retry
+                start_embedded_server_if_needed(base)
+                time.sleep(1)
+                continue
             if status == 200:
                 try:
                     payload = json.loads(body.decode('utf-8'))
@@ -508,15 +563,23 @@ def main():
                 mtype = payload.get('type','text')
                 raw = payload.get('msg','')
                 sender = payload.get('from')
-                if mtype == 'pub' and sender == peer_id:
-                    try:
-                        peer_pub = rsa_small.deserialize_pub(json.loads(raw))
-                        have_peer_pub = True
-                        peer_pub_fp = pub_fingerprint(peer_pub)
-                        print(f"[handshake] Received peer public key fp={peer_pub_fp}")
-                        maybe_send_session_key()
-                    except Exception as e:
-                        print(f"[handshake] bad pub key: {e}")
+                if mtype == 'pub':
+                    # Auto-adopt peer if not set yet
+                    if not peer_id and sender:
+                        peer_id = sender
+                        if VERBOSE:
+                            print(f"[handshake] Auto-set peer to {peer_id} (received pub)")
+                        maybe_send_pub()
+                    if sender == peer_id:
+                        try:
+                            peer_pub = rsa_small.deserialize_pub(json.loads(raw))
+                            have_peer_pub = True
+                            peer_pub_fp = pub_fingerprint(peer_pub)
+                            if VERBOSE:
+                                print(f"[handshake] Received peer public key fp={peer_pub_fp}")
+                            maybe_send_session_key()
+                        except Exception as e:
+                            print(f"[handshake] bad pub key: {e}")
                 elif mtype == 'keyx' and sender == peer_id:
                     if not session_established:
                         try:
@@ -534,23 +597,35 @@ def main():
                             print(f"[handshake] key decrypt error: {e}")
                     else:
                         pass
+                elif mtype == 'bye':
+                    # Peer explicitly quit. Inform user and reset session state.
+                    who = sender or 'peer'
+                    print(f"[info] {who} has quit. Session reset.")
+                    have_peer_pub = False
+                    peer_pub = None
+                    peer_pub_fp = None
+                    session_established = False
+                    # keep peer_id to allow quick re-handshake if peer returns
                 elif mtype == 'text':
-                    print(f"\n[recv] Encrypted from {sender}: {raw}")
+                    if VERBOSE:
+                        print(f"\n[recv] Encrypted from {sender}: {raw}")
                     if session_established:
                         try:
                             pt = decrypt_ecb_bytes(bytes.fromhex(raw), session_key)
-                            print("[recv] Decrypted:", pt.decode('utf-8','replace'))
+                            print("[recv]", pt.decode('utf-8','replace'))
                         except Exception as e:
                             print(f"[recv] decrypt error: {e}")
                     else:
-                        print("[recv] (no session key yet)")
+                        if VERBOSE:
+                            print("[recv] (no session key yet)")
             elif status == 204:
                 pass
             maybe_send_pub()
             maybe_send_session_key()
 
     threading.Thread(target=receiver_loop, daemon=True).start()
-    print("[chat] Waiting. Handshake uses messages of type pub, keyx.")
+    if VERBOSE:
+        print("[chat] Waiting. Handshake uses messages of type pub, keyx.")
     maybe_send_pub()
     while True:
         try:
@@ -559,11 +634,24 @@ def main():
             line = '/quit'
         if not line: continue
         if line.lower().startswith('/quit'):
+            # Notify peer we're quitting (best effort)
+            if peer_id:
+                try:
+                    send_payload({'from': my_id, 'to': peer_id, 'type': 'bye', 'msg': ''})
+                except Exception:
+                    pass
             stop_flag['stop'] = True
             print('[chat] Quit.')
             return
         if line.lower().startswith('/to '):
+            prev_peer = peer_id
             peer_id = line.split(None,1)[1].strip()
+            # best-effort notify previous peer
+            if prev_peer and prev_peer != peer_id:
+                try:
+                    send_payload({'from': my_id, 'to': prev_peer, 'type': 'bye', 'msg': ''})
+                except Exception:
+                    pass
             # reset handshake state for new peer
             have_peer_pub = False
             peer_pub = None
@@ -576,7 +664,9 @@ def main():
             print(f"[chat] peer={peer_id} (handshake reset)")
             maybe_send_pub(); maybe_send_session_key(); flush_outgoing_queue(); continue
         if not peer_id:
-            print('[chat] set peer first with /to <id>'); continue
+            if VERBOSE:
+                print('[chat] set peer first with /to <id>')
+            continue
         if not session_established:
             data = line.encode('utf-8')
             with queue_lock:
@@ -586,8 +676,9 @@ def main():
         data = line.encode('utf-8')
         cipher = encrypt_ecb_bytes(data, session_key)
         send_payload({'from': my_id, 'to': peer_id, 'type': 'text', 'cipher': cipher.hex(), 'size': len(data)})
-        print('[send] plaintext:', line)
-        print('[send] encrypted:', cipher.hex())
+        print('[send]', line)
+        if VERBOSE:
+            print('[send] encrypted:', cipher.hex())
 
 if __name__ == '__main__':
     try:
