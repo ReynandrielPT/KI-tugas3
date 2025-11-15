@@ -4,21 +4,13 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from des_traditional import encrypt_ecb_bytes, decrypt_ecb_bytes
 import rsa_small
+from build_http import http_post_json, http_get
 
 SERVER_DEFAULT = 'http://127.0.0.1:8002'
 VERBOSE = False  # reduce console noise; set True for detailed handshake/debug logs
 _embedded_started = False
 
-def http_post_json(url, obj):
-    data = json.dumps(obj).encode('utf-8')
-    req = Request(url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
-    with urlopen(req) as resp:
-        return resp.getcode(), resp.read()
-
-def http_get(url):
-    req = Request(url, method='GET')
-    with urlopen(req) as resp:
-        return resp.getcode(), resp.read()
+## HTTP helpers are now provided by build_http module
 
 def _embedded_parse_request(conn):
     data = b''
@@ -393,38 +385,16 @@ def _embedded_server_loop(host: str, port: int):
             threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
 
 def start_embedded_server_if_needed(base_url: str):
-    global _embedded_started
-    if _embedded_started:
-        return
+    # No-op: external server is used for client->server->client relay
+    return
+
+def wait_for_relay(base_url: str, retries: int = 1, delay: float = 0.1) -> bool:
+    # Minimal probe; external server expected to be running
     try:
         status, _ = http_get(base_url + f"/recv?client=__probe__&wait=0")
-        if status in (200, 204, 400):
-            _embedded_started = True
-            return
+        return status in (200, 204, 400)
     except Exception:
-        pass
-    parsed = urlparse(base_url)
-    host = '0.0.0.0'
-    port = int(parsed.port or (443 if parsed.scheme == 'https' else 80))
-    try:
-        threading.Thread(target=_embedded_server_loop, args=(host, port), daemon=True).start()
-        _embedded_started = True
-        if VERBOSE:
-            print(f"[info] Embedded relay starting on http://{host}:{port} ...")
-    except Exception as e:
-        print(f"[warn] Failed to start embedded relay: {e}")
-
-def wait_for_relay(base_url: str, retries: int = 20, delay: float = 0.2) -> bool:
-    """Probe the relay HTTP endpoint until it's ready or retries exhausted."""
-    for _ in range(max(1, retries)):
-        try:
-            status, _ = http_get(base_url + f"/recv?client=__probe__&wait=0")
-            if status in (200, 204, 400):
-                return True
-        except Exception:
-            pass
-        time.sleep(delay)
-    return False
+        return False
 
 def usage():
     print("Usage: python client3.py <my_id> [peer_id]\nCommands: /to <peer> | /quit")
@@ -436,10 +406,9 @@ def main():
         usage(); return
     my_id = args[0]
     peer_id = args[1] if len(args) >= 2 else None
-    # Ensure embedded relay is up locally; if not, start and wait briefly.
-    start_embedded_server_if_needed(base)
-    if not wait_for_relay(base):
-        print('[warn] Relay not ready yet; client will retry automatically...')
+    # Expect external relay server to be running on SERVER_DEFAULT
+    if not wait_for_relay(base) and VERBOSE:
+        print('[warn] Relay not reachable yet; client will retry automatically...')
     if VERBOSE:
         print(f"[info] my_id={my_id}")
         if peer_id:
@@ -451,7 +420,8 @@ def main():
         except (EOFError, KeyboardInterrupt): pass
 
     if VERBOSE:
-        print("[info] Generating RSA keypair...")
+        if VERBOSE:
+            print("[info] Generating RSA keypair...")
     pub, priv = rsa_small.generate_keypair(1024)
     def pub_fingerprint(p):
         try:
@@ -463,8 +433,20 @@ def main():
 
     my_pub_fp = pub_fingerprint(pub)
     if VERBOSE:
-        print("[info] RSA pub n bits=", (pub[0].bit_length()))
-        print(f"[info] Our RSA pub fp={my_pub_fp}")
+        if VERBOSE:
+            print("[info] RSA pub n bits=", (pub[0].bit_length()))
+            print(f"[info] Our RSA pub fp={my_pub_fp}")
+
+        # Register our public key on the server for distribution
+        def register_pub():
+            try:
+                status, _ = http_post_json(base + '/register', {'id': my_id, 'pub': rsa_small.serialize_pub(pub)})
+                if status != 200 and VERBOSE:
+                    print(f"[handshake] register failed HTTP {status}")
+            except Exception as e:
+                if VERBOSE:
+                    print(f"[handshake] register error: {e}")
+        register_pub()
     session_key = os.urandom(8)
     have_peer_pub = False
     peer_pub = None
@@ -501,12 +483,25 @@ def main():
                 print('[send] encrypted:', cipher.hex())
 
     def maybe_send_pub():
-        nonlocal my_pub_sent
-        if peer_id and not my_pub_sent:
-            send_payload({'from': my_id, 'to': peer_id, 'type': 'pub', 'msg': json.dumps(rsa_small.serialize_pub(pub))})
-            my_pub_sent = True
+        # Repurposed: try to fetch peer pub from server and set state
+        nonlocal have_peer_pub, peer_pub, peer_pub_fp, my_pub_sent
+        if not peer_id or have_peer_pub:
+            return
+        try:
+            status, body = http_get(base + f'/pub?client={peer_id}')
+            if status == 200:
+                obj = json.loads(body.decode('utf-8'))
+                peer_pub = rsa_small.deserialize_pub(obj)
+                have_peer_pub = True
+                peer_pub_fp = pub_fingerprint(peer_pub)
+                if VERBOSE:
+                    print(f"[handshake] Fetched peer public key fp={peer_pub_fp}")
+            else:
+                # peer pub not available yet
+                pass
+        except Exception as e:
             if VERBOSE:
-                print(f"[handshake] Sent our public key fp={my_pub_fp} to {peer_id}")
+                print(f"[handshake] fetch pub error: {e}")
 
     def maybe_send_session_key():
         nonlocal key_sent, session_established
@@ -564,12 +559,7 @@ def main():
                 raw = payload.get('msg','')
                 sender = payload.get('from')
                 if mtype == 'pub':
-                    # Auto-adopt peer if not set yet
-                    if not peer_id and sender:
-                        peer_id = sender
-                        if VERBOSE:
-                            print(f"[handshake] Auto-set peer to {peer_id} (received pub)")
-                        maybe_send_pub()
+                    # Legacy path: still accept pub over message if sent
                     if sender == peer_id:
                         try:
                             peer_pub = rsa_small.deserialize_pub(json.loads(raw))
@@ -620,13 +610,15 @@ def main():
                             print("[recv] (no session key yet)")
             elif status == 204:
                 pass
+            # Periodically try to fetch peer pub from server
             maybe_send_pub()
             maybe_send_session_key()
 
     threading.Thread(target=receiver_loop, daemon=True).start()
     if VERBOSE:
-        print("[chat] Waiting. Handshake uses messages of type pub, keyx.")
-    maybe_send_pub()
+        if VERBOSE:
+            print("[chat] Waiting. Handshake uses messages of type pub, keyx.")
+        maybe_send_pub()
     while True:
         try:
             line = input('> ').strip()
