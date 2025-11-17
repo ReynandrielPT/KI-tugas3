@@ -1,61 +1,139 @@
-# Simple Encrypted Chat v3 (DES + RSA Key Exchange)
+# Simple Encrypted Chat (DES + RSA Key Exchange)
 
-Mirip dengan versi Tugas2, tetapi sekarang ada distribusi kunci publik RSA untuk menegosiasikan kunci sesi DES secara otomatis. Perbedaan dibuat sekecil mungkin.
+## Overview
 
-## File
+Lightweight HTTP relay server and console chat client using DES (ECB) for message confidentiality and a simple RSA key exchange to establish an 8-byte session key. Designed for learning; not secure for production.
 
-- `client3.py` : Aplikasi chat + relay embedded (port default 8002)
-- `des_traditional.py` : Implementasi DES (ECB) sama seperti versi sebelumnya
-- `rsa_small.py` : RSA sederhana (tanpa padding, edukasi) untuk menukar kunci sesi 8 byte
+# Chat Terenkripsi Sederhana (DES + Pertukaran Kunci RSA)
 
-## Cara Pakai (1 Mesin / 2 Mesin)
+## Ikhtisar
 
-### Requirements
+Server relay HTTP ringan dan klien obrolan berbasis konsol yang menggunakan DES (ECB) untuk kerahasiaan pesan serta pertukaran kunci RSA sederhana untuk menetapkan kunci sesi 8 byte. Contoh ini ditujukan untuk pembelajaran; tidak aman untuk penggunaan produksi.
 
-- Python 3.8 or newer.
-- Works on Windows PowerShell.
+## Struktur Repository
 
-Jika Anda menggunakan Python 3.8, seluruh anotasi tipe sudah disesuaikan agar kompatibel (tidak perlu Python 3.9).
+- `server.py`: Server relay HTTP yang menyediakan endpoint `/register`, `/pub`, `/send`, `/recv`.
+- `client.py`: Klien obrolan konsol yang mengenkripsi pesan dengan DES dan menggunakan RSA untuk penukaran kunci.
+- `des_traditional.py`: Implementasi DES (ECB) dengan padding mirip PKCS#7.
+- `rsa_small.py`: Utilitas RSA minimal untuk pembuatan pasangan kunci, enkripsi/dekripsi, dan serialisasi.
+- `build_http.py`: Helper ringan untuk HTTP GET/POST.
+- `server.log`: File log output server.
 
-1. Terminal 1 (misal `alice`):
+## Persyaratan
 
-   ```
-   python client3.py alice
-   ```
+- Python 3.8 atau lebih baru
+- Windows PowerShell (didukung)
 
-   Tekan Enter saat diminta peer kalau ingin menunggu.
+## Panduan Singkat
 
-2. Terminal 2 (misal `bob`):
+1. Jalankan relay server
 
-   ```
-   python client3.py bob alice
-   ```
+```
+python server.py
+```
 
-3. Handshake (otomatis):
+Jika ingin menentukan host dan port:
 
-   - Jalankan `alice` dulu (tanpa peer). Alice akan menunggu pesan masuk.
-   - Jalankan `bob` dengan peer `alice`. Bob otomatis mengirim `pub` ke `alice`.
-   - Alice otomatis "auto-adopt" peer dari pengirim pertama `pub`, mengirim balik `pub`.
-   - HANYA salah satu pihak mengirim `keyx` (penentu: id yang lebih kecil secara leksikografis, mis. `alice` < `bob`). Pengirim langsung menganggap sesi siap setelah mengirim `keyx`; penerima akan siap setelah berhasil mendekripsi.
-   - Ketika kunci sesi 8 byte diterima dan didekripsi, akan muncul: "Session key established".
+```
+python server.py 0.0.0.0 8002
+```
 
-4. Chat:
-   - Ketik pesan biasa setelah sesi siap.
-   - Dari sisi yang belum set peer: gunakan `/to <id>`.
+2. Jalankan dua klien (bisa di mesin yang sama atau berbeda)
 
-## Perintah
+Terminal A:
 
-- `/to <id>` : Set penerima
-- `/quit` : Keluar
+```
+python client.py alice bob
+```
+
+Terminal B:
+
+```
+python client.py bob alice
+```
+
+Jika tidak menyertakan peer, klien akan meminta input atau menunggu:
+
+```
+python client.py alice
+```
+
+## Perintah Klien
+
+- `/to <peer>`: Mengatur atau mengganti peer.
+- `/quit`: Keluar dari aplikasi.
+
+## Cara Kerja
+
+- Setiap klien membuat pasangan kunci RSA saat dijalankan.
+- Klien dapat mendaftarkan kunci publiknya ke server menggunakan endpoint `/register`.
+- ID yang lebih kecil secara leksikografis mengirim pesan `keyx` yang berisi kunci sesi DES (8 byte) terenkripsi dengan kunci publik RSA peer.
+- Setelah kedua pihak mengetahui kunci sesi 8 byte, pesan bertipe `text` akan dikirim terenkripsi menggunakan DES-ECB dan didekripsi oleh penerima.
+
+## API HTTP (Server)
+
+### POST `/register`
+
+Contoh request:
+
+```
+{"id":"alice","pub":{"n":"<hex>","e":65537}}
+```
+
+Contoh response:
+
+```
+{"ok":true}
+```
+
+### GET `/pub?client=<id>`
+
+Response 200 contoh:
+
+```
+{"n":"<hex>","e":65537}
+```
+
+### POST `/send`
+
+Contoh request:
+
+```
+{"from":"alice","to":"bob","type":"pub","msg":"{...}"}
+```
+
+```
+{"from":"alice","to":"bob","type":"keyx","msg":"<hex>","size":8}
+```
+
+```
+{"from":"alice","to":"bob","type":"text","cipher":"<hex>","size":N}
+```
+
+Response contoh:
+
+```
+{"queued":true}
+```
+
+### GET `/recv?client=<id>&wait=<seconds>`
+
+Response 200 contoh:
+
+```
+{"from":"bob","type":"text","msg":"<hex>","size":N}
+```
+
+Response 204: Tidak ada konten
+
+## Log
+
+- Server menampilkan pratinjau request ke konsol dan menulis entri bertanda waktu ke `server.log`.
 
 ## Catatan
 
-- Port relay default: 8002 (ubah `SERVER_DEFAULT` di `client3.py` bila perlu).
-- RSA ini minimal (tidak aman untuk produksi, tidak ada padding). DES ECB juga tidak disarankan untuk produksi.
-- Fokus tugas: demonstrasi distribusi kunci publik + penggunaan kunci sesi simetris.
+- DES-ECB dan RSA tanpa padding tidak aman; proyek ini hanya untuk tujuan edukasi.
 
-## Ringkas Perbedaan vs Tugas2
+## Notes
 
-- Penambahan modul RSA kecil (`rsa_small.py`).
-- Handshake otomatis: kirim `pub`, lalu `keyx` berisi kunci DES terenkripsi.
-- Sisanya (relay, struktur pesan, DES) hampir sama.
+- DES-ECB and RSA without padding are insecure; this project is for educational use only.

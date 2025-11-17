@@ -7,12 +7,15 @@ from datetime import datetime
 inboxes: dict[str, list[dict]] = {}
 pubs: dict[str, dict] = {}
 cond = threading.Condition()
+_packet_counter = 0
+stop_event = threading.Event()
+_listener_sock: socket.socket | None = None
 
 
 def log_event(kind: str, info: str):
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     line = f"{ts} [{kind}] {info}"
-    print(line, flush=True)
+    # Write to log file only; keep terminal quiet
     try:
         with open('server.log', 'a', encoding='utf-8') as f:
             f.write(line + "\n")
@@ -22,13 +25,16 @@ def log_event(kind: str, info: str):
 
 def log_packet(direction: str, text: str):
     # direction: IN or OUT
-    border = f"----- {direction} PACKET -----"
-    print(border)
-    print(text.rstrip('\n'))
-    print("----- END PACKET -----", flush=True)
+    # Print packet preview to terminal without borders, and write a timestamped entry to server.log
     try:
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        body = text.replace('\r\n', '\n').rstrip('\n')
+        # Console: just the packet text
+        print(body, flush=True)
+        # File: include timestamp and direction
+        entry = f"{ts} [{direction}]\n{body}\n"
         with open('server.log', 'a', encoding='utf-8') as f:
-            f.write(border + "\n" + text + "\n----- END PACKET -----\n")
+            f.write(entry)
     except Exception:
         pass
 
@@ -225,15 +231,27 @@ def handle_client(conn, addr):
 
 
 def run(host='0.0.0.0', port=8002):
+    global _listener_sock
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        _listener_sock = s
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((host, port))
         s.listen(5)
+        s.settimeout(1.0)
         print(f"Relay server listening on http://{host}:{port}")
-        while True:
-            conn, addr = s.accept()
+        while not stop_event.is_set():
+            try:
+                conn, addr = s.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                # Likely closed during shutdown
+                if stop_event.is_set():
+                    break
+                continue
             t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
             t.start()
+        print("Shutting down listener...")
 
 
 if __name__ == '__main__':
@@ -248,4 +266,34 @@ if __name__ == '__main__':
         except ValueError:
             pass
     print(f"Starting relay on http://{host}:{port}")
-    run(host, port)
+
+    def console_loop():
+        print("Type 'quit' or 'exit' to stop the server.")
+        while not stop_event.is_set():
+            try:
+                cmd = input('server> ').strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                cmd = 'quit'
+            if cmd in ('quit', 'exit', 'stop', 'shutdown', ':q'):
+                print('Stopping server...')
+                stop_event.set()
+                # Close listener to unblock accept()
+                try:
+                    if _listener_sock is not None:
+                        _listener_sock.close()
+                except Exception:
+                    pass
+                break
+            elif cmd in ('help', '?'):
+                print("Commands: quit | exit | stop | shutdown | :q | help")
+            elif not cmd:
+                continue
+            else:
+                print(f"Unknown command: {cmd}")
+
+    # Run console loop in a helper thread so main thread can host the listener
+    threading.Thread(target=console_loop, daemon=True).start()
+    try:
+        run(host, port)
+    finally:
+        print("Server stopped.")

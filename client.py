@@ -141,7 +141,8 @@ def main():
     peer_id = args[1] if len(args) >= 2 else None
     start_embedded_server_if_needed(base)
     print(f'[info] my_id={my_id}')
-    if peer_id: print(f'[info] peer={peer_id}')
+    if peer_id:
+        print(f'[info] peer={peer_id}')
     else:
         try:
             p = input('[setup] Enter peer id (Enter to wait): ').strip()
@@ -152,6 +153,17 @@ def main():
     my_pub_fp = pub_fingerprint(pub)
     print('[info] RSA pub n bits=', pub[0].bit_length())
     print(f'[info] Our RSA pub fp={my_pub_fp}')
+    # Register our public key to server PKA
+    try:
+        reg_payload = {'id': my_id, 'pub': rsa_small.serialize_pub(pub)}
+        status, body = http_post_json(base + '/register', reg_payload)
+        if status == 200:
+            if VERBOSE:
+                print('[pka] Registered public key with server')
+        else:
+            print(f'[pka] register failed HTTP {status}: {body[:120]!r}')
+    except Exception as e:
+        print(f'[pka] register error: {e}')
     session_key = os.urandom(8)
     have_peer_pub = False
     peer_pub = None
@@ -184,41 +196,133 @@ def main():
         if peer_id and not my_pub_sent:
             send_payload({'from': my_id, 'to': peer_id, 'type': 'pub', 'msg': json.dumps(rsa_small.serialize_pub(pub))})
             my_pub_sent = True
-            print(f'[handshake] Sent our public key fp={my_pub_fp} to {peer_id}')
+            ui_print(f'[handshake] Sent our public key fp={my_pub_fp} to {peer_id}', reprompt=True)
+    def am_initiator() -> bool:
+        try:
+            return bool(peer_id) and str(my_id) < str(peer_id)
+        except Exception:
+            return False
+
     def maybe_send_session_key():
-        nonlocal key_sent
-        if have_peer_pub and not key_sent:
+        nonlocal key_sent, session_established
+        # Only the lexicographically smaller id initiates key exchange
+        if have_peer_pub and not key_sent and am_initiator():
             enc_key_bytes = rsa_small.encrypt(session_key, peer_pub)
             send_payload({'from': my_id, 'to': peer_id, 'type': 'keyx', 'msg': enc_key_bytes.hex(), 'size': len(session_key)})
             key_sent = True
             sk_fp = hashlib.sha256(session_key).hexdigest()[:16]
             peer_fp = peer_pub_fp or 'unknown'
-            print(f'[handshake] Sent encrypted session key (sk_fp={sk_fp}) using peer fp={peer_fp}')
+            ui_print(f'[handshake] Sent encrypted session key (sk_fp={sk_fp}) using peer fp={peer_fp}', reprompt=False)
+            # As initiator, consider session established for sending immediately
+            if not session_established:
+                session_established = True
+                ui_print(f'[handshake] Session key established (sk_fp={sk_fp})', reprompt=False)
+                flush_outgoing_queue()
+    def maybe_fetch_peer_pub():
+        nonlocal have_peer_pub, peer_pub, peer_pub_fp
+        if not peer_id or have_peer_pub:
+            return
+        try:
+            status, body = http_get(base + f'/pub?client={peer_id}', timeout=8.0)
+            if status == 200:
+                try:
+                    obj = json.loads(body.decode('utf-8'))
+                    pp = rsa_small.deserialize_pub(obj)
+                    peer_pub = pp
+                    peer_pub_fp = pub_fingerprint(peer_pub)
+                    have_peer_pub = True
+                    ui_print(f'[pka] Retrieved peer pub from server (fp={peer_pub_fp})', reprompt=False, newline_before=True)
+                except Exception as e:
+                    if VERBOSE:
+                        print(f'[pka] bad pub parse: {e}')
+            elif status == 404:
+                # Not yet registered by peer; keep trying silently
+                if VERBOSE:
+                    print('[pka] peer pub not found yet')
+            else:
+                if VERBOSE:
+                    print(f'[pka] HTTP {status} fetching pub')
+        except Exception as e:
+            if VERBOSE:
+                print(f'[pka] fetch error: {e}')
+    def reset_handshake(new_session_key: bytes | None = None):
+        nonlocal have_peer_pub, peer_pub, peer_pub_fp, session_established, my_pub_sent, key_sent, session_key
+        have_peer_pub = False
+        peer_pub = None
+        peer_pub_fp = None
+        session_established = False
+        my_pub_sent = False
+        key_sent = False
+        session_key = new_session_key or os.urandom(8)
+
+    # Console prompt management
+    prompt_state = {'active': False}
+    def ui_print(msg: str, reprompt: bool = False, newline_before: bool = False):
+        try:
+            if newline_before:
+                sys.stdout.write('\n')
+            sys.stdout.write(msg + '\n')
+            sys.stdout.flush()
+            if reprompt and prompt_state['active']:
+                sys.stdout.write('> ')
+                sys.stdout.flush()
+        except Exception:
+            pass
+
     def receiver_loop():
-        nonlocal have_peer_pub, peer_pub, peer_pub_fp, session_established, session_key
+        nonlocal have_peer_pub, peer_pub, peer_pub_fp, session_established, session_key, peer_id
+        poll_wait = 30
+        http_timeout = poll_wait + 5
+        def _is_timeout_error(err: Exception) -> bool:
+            try:
+                import socket as _socket
+                from urllib.error import URLError as _URLError
+                if isinstance(err, _socket.timeout):
+                    return True
+                if isinstance(err, _URLError) and isinstance(getattr(err, 'reason', None), _socket.timeout):
+                    return True
+            except Exception:
+                pass
+            return 'timed out' in str(err).lower()
         while not stop_flag['stop']:
             try:
-                status, body = http_get(base + f'/recv?client={my_id}&wait=30')
+                status, body = http_get(base + f'/recv?client={my_id}&wait={poll_wait}', timeout=http_timeout)
             except Exception as e:
-                if not stop_flag['stop']: print(f'[recv] error: {e}')
-                time.sleep(1); continue
+                # Suppress benign long-poll timeouts; only log real errors
+                if not stop_flag['stop'] and not _is_timeout_error(e):
+                    ui_print(f'[recv] error: {e}')
+                # Tiny backoff to avoid busy loop
+                time.sleep(0.2)
+                continue
             if status == 200:
                 try: payload = json.loads(body.decode('utf-8'))
-                except Exception as e: print(f'[recv] invalid JSON {e}'); continue
+                except Exception as e: ui_print(f'[recv] invalid JSON {e}'); continue
                 mtype = payload.get('type','text')
                 raw = payload.get('msg','')
                 sender = payload.get('from')
-                if mtype == 'pub' and sender == peer_id:
-                    try:
-                        peer_pub = rsa_small.deserialize_pub(json.loads(raw))
-                        have_peer_pub = True
-                        peer_pub_fp = pub_fingerprint(peer_pub)
-                        print(f'[handshake] Received peer public key fp={peer_pub_fp}')
-                        maybe_send_session_key()
-                    except Exception as e:
-                        print(f'[handshake] bad pub key: {e}')
+                if mtype == 'pub':
+                    # Auto-adopt the first peer if none is set
+                    if not peer_id and sender:
+                        peer_id = sender
+                        ui_print(f'[handshake] Auto-selected peer: {peer_id}', reprompt=False)
+                    if sender == peer_id:
+                        try:
+                            incoming_pub = rsa_small.deserialize_pub(json.loads(raw))
+                            incoming_fp = pub_fingerprint(incoming_pub)
+                            # If peer restarts (pub changes), reset and re-handshake
+                            if peer_pub_fp and incoming_fp != peer_pub_fp:
+                                ui_print(f'[handshake] Peer pub changed (old={peer_pub_fp} new={incoming_fp}); resetting session', reprompt=False)
+                                reset_handshake()
+                            peer_pub = incoming_pub
+                            peer_pub_fp = incoming_fp
+                            have_peer_pub = True
+                            ui_print(f'[handshake] Received peer public key fp={peer_pub_fp}', reprompt=False)
+                            maybe_send_session_key()
+                        except Exception as e:
+                            ui_print(f'[handshake] bad pub key: {e}', reprompt=False)
                 elif mtype == 'keyx' and sender == peer_id:
-                    if not session_established:
+                    # Only the non-initiator should adopt incoming key
+                    if not am_initiator() and not session_established:
                         try:
                             key_bytes = bytes.fromhex(raw)
                             sk = rsa_small.decrypt(key_bytes, priv)
@@ -226,29 +330,48 @@ def main():
                                 session_key = sk
                                 session_established = True
                                 sk_fp = hashlib.sha256(session_key).hexdigest()[:16]
-                                print(f'[handshake] Session key established (sk_fp={sk_fp})')
+                                ui_print(f'[handshake] Session key established (sk_fp={sk_fp})', reprompt=False)
                                 flush_outgoing_queue()
                             else:
-                                print('[handshake] Invalid session key length')
+                                ui_print('[handshake] Invalid session key length')
                         except Exception as e:
-                            print(f'[handshake] key decrypt error: {e}')
+                            ui_print(f'[handshake] key decrypt error: {e}')
+                    else:
+                        if VERBOSE:
+                            ui_print('[handshake] Ignoring unexpected keyx (we are initiator or already established)')
                 elif mtype == 'text':
-                    print(f'\n[recv] Encrypted from {sender}: {raw}')
+                    ui_print(f'[recv] Encrypted from {sender}: {raw}', reprompt=False, newline_before=True)
                     if session_established:
                         try:
                             pt = decrypt_ecb_bytes(bytes.fromhex(raw), session_key)
-                            print('[recv] Decrypted:', pt.decode('utf-8','replace'))
+                            # Trim to declared size if provided (defensive)
+                            try:
+                                size = int(payload.get('size', len(pt)))
+                                if 0 <= size <= len(pt):
+                                    pt = pt[:size]
+                            except Exception:
+                                pass
+                            ui_print('[recv] Decrypted: ' + pt.decode('utf-8','replace'), reprompt=True)
                         except Exception as e:
-                            print(f'[recv] decrypt error: {e}')
+                            ui_print(f'[recv] decrypt error: {e}')
                     else:
-                        print('[recv] (no session key yet)')
-            maybe_send_pub(); maybe_send_session_key()
+                        ui_print('[recv] (no session key yet)')
+            elif status == 204:
+                # No message; act as a quiet heartbeat (no noisy errors)
+                if VERBOSE:
+                    ui_print('[recv] no messages (poll)', reprompt=False)
+            # Keep trying to handshake until established
+            maybe_fetch_peer_pub(); maybe_send_pub(); maybe_send_session_key()
     threading.Thread(target=receiver_loop, daemon=True).start()
     print('[chat] Type messages. /to <peer> to switch, /quit to exit.')
     maybe_send_pub()
     while True:
-        try: line = input('> ').strip()
+        try:
+            prompt_state['active'] = True
+            line = input('> ').strip()
         except (EOFError, KeyboardInterrupt): line = '/quit'
+        finally:
+            prompt_state['active'] = False
         if not line: continue
         if line.lower().startswith('/quit'):
             stop_flag['stop'] = True
@@ -256,30 +379,24 @@ def main():
             return
         if line.lower().startswith('/to '):
             peer_id = line.split(None,1)[1].strip()
-            have_peer_pub = False
-            peer_pub = None
-            peer_pub_fp = None
-            session_established = False
-            my_pub_sent = False
-            key_sent = False
-            session_key = os.urandom(8)
+            reset_handshake()
             print(f'[chat] peer={peer_id} (handshake reset)')
-            maybe_send_pub(); maybe_send_session_key(); flush_outgoing_queue(); continue
+            # Try to get peer pub from server immediately
+            maybe_fetch_peer_pub(); maybe_send_pub(); maybe_send_session_key(); flush_outgoing_queue(); continue
         if not peer_id:
             print('[chat] set peer first with /to <id>'); continue
         if not session_established:
             data = line.encode('utf-8')
             with queue_lock: outgoing_queue.append(data)
             print('[chat] queued (waiting handshake)')
-            maybe_send_pub(); maybe_send_session_key(); continue
+            maybe_fetch_peer_pub(); maybe_send_pub(); maybe_send_session_key(); continue
         data = line.encode('utf-8')
         cipher = encrypt_ecb_bytes(data, session_key)
         send_payload({'from': my_id, 'to': peer_id, 'type': 'text', 'cipher': cipher.hex(), 'size': len(data)})
         print('[send] plaintext:', line)
         print('[send] encrypted:', cipher.hex())
 
-if False and __name__ == '__main__':
-    # Legacy entrypoint disabled to avoid double-running two clients in one process.
+if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
